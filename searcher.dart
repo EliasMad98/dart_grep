@@ -1,215 +1,237 @@
-#!/usr/bin/env dart
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-void printHelp() {
-  print('''usage: searcher [OPTIONS] PATTERN [PATH ...]
-Options:
-  -A, --after-context <n>     print N lines of trailing context
-  -B, --before-context <n>    print N lines of leading context
-  -C, --context <n>           print N lines of leading and trailing context
-  -c, --color                 highlight matches in color
-  -h, --hidden                search hidden files and folders
-  -i, --ignore-case           case-insensitive search
-      --no-heading            print filename for each match on same line
-      --help                  show this help message
-''');
+const int MAX_LINE_LENGTH = 10000;
+
+class Options {
+  bool ignoreCase = false;
+  bool color = false;
+  bool hidden = false;
+  bool noHeading = false;
+  int before = 0;
+  int after = 0;
 }
 
 Future<void> main(List<String> args) async {
   if (args.isEmpty || args.contains('--help')) {
     printHelp();
-    exit(0);
+    return;
   }
 
-  // Options
-  var color = false;
-  var ignoreCase = false;
-  var showHidden = false;
-  var noHeading = false;
-  int before = 0;
-  int after = 0;
-  bool foundAny = false;
+  final options = Options();
+  final positional = <String>[];
 
-  // Parse arguments
-  final paths = <String>[];
-  String? pattern;
-
-  for (var i = 0; i < args.length; i++) {
-    final arg = args[i];
-
-    switch (arg) {
-      case '-c':
-      case '--color':
-        color = true;
-        break;
+  for (int i = 0; i < args.length; i++) {
+    switch (args[i]) {
       case '-i':
       case '--ignore-case':
-        ignoreCase = true;
+        options.ignoreCase = true;
+        break;
+      case '-c':
+      case '--color':
+        options.color = true;
         break;
       case '-h':
       case '--hidden':
-        showHidden = true;
+        options.hidden = true;
         break;
       case '--no-heading':
-        noHeading = true;
+        options.noHeading = true;
         break;
       case '-A':
       case '--after-context':
-        after = int.parse(args[++i]);
+        options.after = int.parse(args[++i]);
         break;
       case '-B':
       case '--before-context':
-        before = int.parse(args[++i]);
+        options.before = int.parse(args[++i]);
         break;
       case '-C':
       case '--context':
-        before = after = int.parse(args[++i]);
+        final n = int.parse(args[++i]);
+        options.before = n;
+        options.after = n;
         break;
-
-      // Ignore irrelevant flags used by grep/ripgrep/test.py
-      case '--color=never':
-      case '--with-filename':
-      case '--line-number':
-      case '--no-ignore':
-      case '--exclude=.*':
-      case '-r':
-        // just ignore
-        break;
-
       default:
-        if (arg.startsWith('--color=')) {
-          continue;
-        } else if (pattern == null) {
-          pattern = arg;
-        } else {
-          paths.add(arg);
-        }
+        positional.add(args[i]);
     }
   }
 
-  if (pattern == null || paths.isEmpty) {
-    stderr.writeln('Error: Missing PATTERN or PATH.\n');
-    printHelp();
+  if (positional.length < 2) {
+    stderr.writeln('Pattern and path required.');
     exit(1);
   }
 
-  final regex = RegExp(pattern,
-      caseSensitive: !ignoreCase, multiLine: false, unicode: true);
+  final pattern = positional.first;
+  final targets = positional.sublist(1);
 
-  for (final path in paths) {
-    final type = FileSystemEntity.typeSync(path, followLinks: false);
-    if (type == FileSystemEntityType.directory) {
-      final result = await _searchDirectory(
-        Directory(path),
-        regex,
-        color,
-        before,
-        after,
-        showHidden,
-        noHeading,
-      );
-      if (result) foundAny = true;
-    } else if (type == FileSystemEntityType.file) {
-      final result = await _searchFile(
-        File(path),
-        regex,
-        color,
-        before,
-        after,
-        noHeading,
-      );
-      if (result) foundAny = true;
-    }
+  final regex = RegExp(
+    pattern,
+    caseSensitive: !options.ignoreCase,
+    unicode: false, // grep-like \w behavior
+  );
+
+  final literalHint = _extractLiteralHint(pattern, options.ignoreCase);
+
+  for (final target in targets) {
+    await traverse(target, options, (file) async {
+      await searchFile(file, regex, literalHint, options);
+    });
   }
-
-  exit(foundAny ? 0 : 1);
 }
 
-Future<bool> _searchDirectory(
-  Directory dir,
-  RegExp regex,
-  bool color,
-  int before,
-  int after,
-  bool showHidden,
-  bool noHeading,
+Future<void> traverse(
+  String path,
+  Options options,
+  Future<void> Function(File) onFile,
 ) async {
-  bool foundAny = false;
-  await for (var entity in dir.list(recursive: true, followLinks: false)) {
-    final name = entity.uri.pathSegments.isNotEmpty
-        ? entity.uri.pathSegments.last
-        : '';
-    if (!showHidden && name.startsWith('.')) continue;
+  final type = FileSystemEntity.typeSync(path);
 
-    if (entity is File) {
-      final result = await _searchFile(entity, regex, color, before, after, noHeading);
-      if (result) foundAny = true;
+  if (type == FileSystemEntityType.file) {
+    await onFile(File(path));
+    return;
+  }
+
+  if (type != FileSystemEntityType.directory) return;
+
+  final dir = Directory(path);
+  await for (final entity in dir.list(followLinks: false)) {
+    final name = entity.uri.pathSegments.last;
+    if (!options.hidden && name.startsWith('.')) continue;
+
+    final t = FileSystemEntity.typeSync(entity.path);
+    if (t == FileSystemEntityType.directory) {
+      await traverse(entity.path, options, onFile);
+    } else if (t == FileSystemEntityType.file) {
+      await onFile(File(entity.path));
     }
   }
-  return foundAny;
 }
 
-bool _isBinaryFile(File file) {
+Future<void> searchFile(
+  File file,
+  RegExp regex,
+  String? literalHint,
+  Options options,
+) async {
+  if (await isBinary(file)) return;
+
+  final lines = <String>[];
+  final matches = <int>[];
+
   try {
-    final bytes = file.openSync().readSync(1024);
+    final stream = file
+        .openRead()
+        .transform(utf8.decoder)
+        .transform(const LineSplitter());
+
+    int lineNo = 0;
+    await for (final line in stream) {
+      lineNo++;
+      lines.add(line);
+
+      if (line.length > MAX_LINE_LENGTH) continue;
+
+      if (literalHint != null) {
+        final hay = options.ignoreCase ? line.toLowerCase() : line;
+        if (!hay.contains(literalHint)) continue;
+      }
+
+      if (regex.hasMatch(line)) {
+        matches.add(lineNo - 1); // zero-based
+      }
+    }
+  } catch (_) {
+    return;
+  }
+
+  if (matches.isEmpty) return;
+
+  // merge context ranges (grep-correct)
+  final ranges = <List<int>>[];
+  for (final m in matches) {
+    final start = (m - options.before).clamp(0, lines.length - 1);
+    final end = (m + options.after).clamp(0, lines.length - 1);
+
+    if (ranges.isEmpty || start > ranges.last[1] + 1) {
+      ranges.add([start, end]);
+    } else {
+      ranges.last[1] = ranges.last[1] > end ? ranges.last[1] : end;
+    }
+  }
+
+  bool headerPrinted = false;
+
+  for (final range in ranges) {
+    for (int i = range[0]; i <= range[1]; i++) {
+      final isMatch = matches.contains(i);
+      final sep = isMatch ? ':' : '-';
+
+      if (!options.noHeading && !headerPrinted) {
+        safeWrite('${file.path}\n');
+        headerPrinted = true;
+      }
+
+      final content = isMatch
+          ? highlight(lines[i], regex, options)
+          : lines[i];
+
+      safeWrite('${file.path}$sep${i + 1}:$content\n');
+    }
+  }
+}
+
+void safeWrite(String s) {
+  try {
+    stdout.write(s);
+  } on FileSystemException catch (e) {
+    if (e.osError?.errorCode == 32) exit(0); // broken pipe
+    rethrow;
+  }
+}
+
+String highlight(String line, RegExp regex, Options options) {
+  if (!options.color) return line;
+  return line.replaceAllMapped(
+    regex,
+    (m) => '\x1b[31m${m.group(0)}\x1b[0m',
+  );
+}
+
+Future<bool> isBinary(File file) async {
+  try {
+    final raf = await file.open();
+    final bytes = await raf.read(8000);
+    await raf.close();
     return bytes.contains(0);
   } catch (_) {
     return true;
   }
 }
 
-Future<bool> _searchFile(
-  File file,
-  RegExp regex,
-  bool color,
-  int before,
-  int after,
-  bool noHeading,
-) async {
-  if (_isBinaryFile(file)) return false;
-
-  List<String> lines;
-  try {
-    lines = await file.readAsLines(encoding: utf8);
-  } catch (_) {
-    return false;
+String? _extractLiteralHint(String pattern, bool ignoreCase) {
+  final matches =
+      RegExp(r'[A-Za-z0-9_]{3,}').allMatches(pattern).map((m) => m.group(0)!);
+  String? best;
+  for (final m in matches) {
+    if (best == null || m.length > best.length) best = m;
   }
+  if (best == null) return null;
+  return ignoreCase ? best.toLowerCase() : best;
+}
 
-  final matches = <int>[];
-  for (var i = 0; i < lines.length; i++) {
-    if (regex.hasMatch(lines[i])) {
-      matches.add(i);
-    }
-  }
+void printHelp() {
+  print('''
+usage: searcher [OPTIONS] PATTERN [PATH ...]
 
-  if (matches.isEmpty) return false;
-  if (!noHeading) print(file.path);
-
-  for (var index in matches) {
-    final start = (index - before).clamp(0, lines.length - 1);
-    final end = (index + after).clamp(0, lines.length - 1);
-
-    for (var i = start; i <= end; i++) {
-      final sep = (i == index) ? ':' : '-';
-      final lineNum = i + 1;
-      var line = lines[i];
-      if (color && i == index) {
-        line = line.replaceAllMapped(
-            regex, (m) => '\x1B[31m${m[0]}\x1B[0m'); // red color
-      }
-
-      if (noHeading) {
-        print('${file.path}:$lineNum:$line');
-      } else {
-        print('$lineNum$sep$line');
-
-        
-      }
-    }
-
-    if (after > 0 || before > 0) print('--');
-  }
-
-  return true;
+-A, --after-context <n>    lines after match
+-B, --before-context <n>   lines before match
+-C, --context <n>          lines before and after
+-c, --color                highlight matches
+-h, --hidden               search hidden files
+-i, --ignore-case          case insensitive
+--no-heading               print filename on each line
+--help                     show this help
+''');
 }
